@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -15,78 +16,91 @@ const (
 	DIR_LENGHT_MAX  = 500
 )
 
-type VideoHash struct {
-	FilePath string
-	Stream   string
-	Errors   int
+type VideoFile struct {
+	FilePath  string
+	TimeStart int64
+	TimeEnd   int64
+	Duration  int64
 }
 
-type DelFiles struct {
-	Orig   string
-	Copies []string
+func isSame(cur VideoFile, new VideoFile) bool {
+	curMin := cur.TimeStart
+	curMax := cur.TimeEnd
+	return curMax >= new.TimeEnd && curMin <= new.TimeStart
 }
 
-func findTheSameFiles(file VideoHash, data []VideoHash) (VideoHash, []VideoHash) {
-	res := make([]VideoHash, 0)
+func findTheSameFiles(file VideoFile, data []VideoFile) (VideoFile, []VideoFile) {
+	res := make([]VideoFile, 0)
 
 	cur := file
 	for _, f := range data {
 		if cur.FilePath == f.FilePath {
 			continue
 		}
-		if file.Stream == f.Stream {
-			if file.Errors > f.Errors {
+		isLarge := isSame(f, cur)
+		if isSame(cur, f) || isLarge {
+			if isLarge {
 				res = append(res, cur)
 				cur = f
+			} else {
+				res = append(res, f)
 			}
-			res = append(res, f)
+
 		}
 	}
+
 	return cur, res
 }
 
-func deduplicateVideos(ch chan VideoHash, wg *sync.WaitGroup, dirPath string) {
-	files := make([]VideoHash, 0)
+func deduplicateVideos(ch chan VideoFile) {
+	files := make([]VideoFile, 0)
 	for msg := range ch {
 		files = append(files, msg)
 	}
 
-	delFiles := make([]DelFiles, 0)
+	delFiles := make(map[string][]VideoFile, 0)
 	for _, f := range files {
-		cur, same := findTheSameFiles(f, files)
-		if len(same) > 0 {
-			copies := make([]string, 0)
-			for _, s := range same {
-				copies = append(copies, s.FilePath)
-			}
-			delFiles = append(delFiles, DelFiles{
-				Orig:   cur.FilePath,
-				Copies: copies,
-			})
-		}
-	}
-
-	for _, f := range delFiles {
-		if f.Orig != "/mnt/deb/kol/recovery/VIDEO/MPEG/01142222.mts" {
+		if _, ok := delFiles[f.FilePath]; !ok {
+			delFiles[f.FilePath] = make([]VideoFile, 0)
+		} else {
 			continue
 		}
-		fmt.Println("del", f.Orig, f.Copies)
+		cur, same := findTheSameFiles(f, files)
+		if len(same) > 0 {
+			copies := make([]VideoFile, 0)
+			for _, s := range same {
+				copies = append(copies, s)
+			}
+			if cur.FilePath != f.FilePath {
+				delFiles[cur.FilePath] = copies
+			} else {
+				delFiles[f.FilePath] = copies
+			}
+
+		}
+	}
+	for _, f := range delFiles {
+		for _, delF := range f {
+			fmt.Println("remove file with no times", delF.FilePath)
+			err := os.Remove(delF.FilePath)
+			if err != nil {
+				fmt.Println("failed to remove:", err)
+			}
+		}
 	}
 }
 
-func getDuplicateVideos(ch chan VideoHash, wg *sync.WaitGroup, dirPath string) {
+func getDuplicateVideos(ch chan VideoFile, wg *sync.WaitGroup, dirPath string) {
 	defer wg.Done()
+
+	layout := "2006-01-02 15:04:05"
+
 	files, err := os.ReadDir(dirPath)
 	if err != nil {
 		panic(err)
 	}
 
-	streamReg, err := regexp.Compile(`(?s)\[STREAM\]\s*.*`)
-	if err != nil {
-		panic(err)
-	}
-
-	errorsReg, err := regexp.Compile(`\[[a-zA-Z0-9]+ @ 0x[a-fA-F0-9]+\] .+`)
+	dateReg, err := regexp.Compile(`(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})`)
 	if err != nil {
 		panic(err)
 	}
@@ -101,42 +115,54 @@ func getDuplicateVideos(ch chan VideoHash, wg *sync.WaitGroup, dirPath string) {
 			panic(err)
 		}
 		if info.IsDir() {
-			//wg.Add(1)
-			//go deleteDuplicateVideos(wg, path.Join(dirPath, fileName))
+			wg.Add(1)
+			go getDuplicateVideos(ch, wg, path.Join(dirPath, fileName))
 			continue
 		}
 
-		cmd := exec.Command("ffprobe", "-v", "error", "-show_format", "-show_streams", filePath)
+		cmd := exec.Command("exiftool", "-d", "'%Y-%m-%d %H:%M:%S'", "-DateTimeOriginal ", "-ExtractEmbedded", filePath)
 
-		output, err := cmd.CombinedOutput()
+		output, err := cmd.Output()
 		if err != nil {
 			fmt.Println(1, string(output))
 			panic(err)
 		}
 
-		filenameReg, err := regexp.Compile(`filename=.+\n`)
-		if err != nil {
-			panic(err)
-		}
 		data := string(output)
-		out := filenameReg.FindString(data)
-		if out == "" {
-			fmt.Println("can not get filename from video metadata", filePath, data)
-			continue
+		dates := strings.Split(data, "\n")
+		times := make([]time.Time, 0)
+	inner:
+		for _, date := range dates {
+			if date == "" {
+				continue inner
+			}
+			d := dateReg.FindString(data)
+			if d == "" {
+				fmt.Println("failed to get date for file:", filePath, date)
+				continue inner
+			}
+			time, err := time.Parse(layout, d)
+			if err != nil {
+				fmt.Println("failed to parse time for file:", filePath, err)
+				continue inner
+			}
+
+			times = append(times, time)
 		}
 
-		stream := streamReg.FindString(data)
-		if stream == "" {
-			fmt.Println("can not get stream for file:", filePath, data)
+		if len(times) == 0 {
+			err := os.Remove(filePath)
+			if err != nil {
+				fmt.Println("failed to remove file without times", err)
+			}
 			continue
 		}
-
-		errors := errorsReg.FindAllString(data, -1)
-
-		ch <- VideoHash{
-			FilePath: filePath,
-			Stream:   strings.Replace(data, stream, "", 1),
-			Errors:   len(errors),
+		var timeL int64 = int64(len(times))
+		ch <- VideoFile{
+			FilePath:  filePath,
+			TimeStart: times[0].Unix(),
+			TimeEnd:   times[timeL-1].Unix(),
+			Duration:  timeL,
 		}
 	}
 
@@ -213,18 +239,18 @@ func main() {
 		wg.Add(1)
 		go splitByLenght(&wg, dirPath)
 		wg.Wait()
-	case "video":
-		ch := make(chan VideoHash)
+	case "mpeg":
+		ch := make(chan VideoFile)
 		go func() {
 			wg.Wait()
 			close(ch)
 		}()
 		wg.Add(1)
 		go getDuplicateVideos(ch, &wg, dirPath)
-		deduplicateVideos(ch, &wg, dirPath)
+		deduplicateVideos(ch)
 
 	default:
-		fmt.Printf("command '%s' is not allowed; allowed commands (name|lenght|video)", command)
+		fmt.Printf("command '%s' is not allowed; allowed commands (name|lenght|mpeg)", command)
 		wg.Done()
 	}
 
@@ -265,7 +291,10 @@ func splitByName(wg *sync.WaitGroup, dirPath string) {
 
 		if info.Size() < DELETE_MIN_SIZE {
 			fmt.Println("try to delete", filePath)
-			os.Remove(filePath)
+			err := os.Remove(filePath)
+			if err != nil {
+				fmt.Println("failed to remove:", err)
+			}
 		}
 
 		prefixReg, err := regexp.Compile(`^[a-zA-Z0-9 ]+_`)
