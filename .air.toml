@@ -1,0 +1,8 @@
+root = "."
+
+[build]
+full_bin = "NODE_ENV=development go run main.go"
+watch_dir = ["."]
+
+[log]
+time = true
